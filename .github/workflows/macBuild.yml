@@ -1,0 +1,112 @@
+name: Build niqivoAI for macOS
+on:
+  workflow_dispatch:
+    inputs:
+      sourceAssetId:
+        description: Approved draft source asset ID
+        required: true
+        type: string
+      sourceSha256:
+        description: Approved source archive SHA-256
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: niqivoMac210
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            target: macArm64
+          - os: macos-15-intel
+            arch: x64
+            target: macX64
+    env:
+      appVersion: 2.1.0
+      macCodesign: '0'
+      generateUpdatePatch: '0'
+    steps:
+      - name: Download approved build source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          sourceAssetId: ${{ inputs.sourceAssetId }}
+          sourceSha256: ${{ inputs.sourceSha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$sourceAssetId" =~ ^[0-9]+$ ]]
+          [[ "$sourceSha256" =~ ^[0-9a-fA-F]{64}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$sourceAssetId" \
+            -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/niqivoSource.tar.gz"
+          printf '%s  %s\n' "$sourceSha256" "$RUNNER_TEMP/niqivoSource.tar.gz" | shasum -a 256 -c -
+          mkdir source
+          tar -xzf "$RUNNER_TEMP/niqivoSource.tar.gz" -C source
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install locked workspace dependencies
+        working-directory: source
+        run: bun install --frozen-lockfile
+      - name: Install Intel compatibility SDK
+        if: matrix.arch == 'x64'
+        working-directory: source/compat/macIntel
+        run: bun install --frozen-lockfile
+      - name: Prepare Intel native SDK
+        if: matrix.arch == 'x64'
+        working-directory: source
+        run: bun compat/macIntel/prepareNative.ts
+      - name: Prepare Apple Silicon SDK
+        if: matrix.arch == 'arm64'
+        working-directory: source
+        run: bun apps/desktop/node_modules/electrobun/bin/electrobun.cjs prepare
+      - name: Build native startup libraries
+        working-directory: source
+        run: bun packages/startup/scripts/buildMac.ts
+      - name: Package niqivoAI
+        working-directory: source
+        run: bun run release:desktop 2.1.0 --initial
+      - name: Verify and collect disk image
+        env:
+          targetFolder: ${{ matrix.target }}
+          expectedArch: ${{ matrix.arch }}
+          sourceSha256: ${{ inputs.sourceSha256 }}
+        run: |
+          set -euo pipefail
+          folder="source/build/desktop/releases/$targetFolder/2.1.0"
+          files=("$folder"/*.dmg)
+          [[ ${#files[@]} -eq 1 && -f "${files[0]}" ]]
+          hdiutil verify "${files[0]}"
+          mountPath="$RUNNER_TEMP/niqivoDiskImage"
+          mkdir "$mountPath"
+          hdiutil attach "${files[0]}" -readonly -nobrowse -mountpoint "$mountPath"
+          trap 'hdiutil detach "$mountPath"' EXIT
+          apps=("$mountPath"/*.app)
+          [[ ${#apps[@]} -eq 1 && -d "${apps[0]}" ]]
+          plist="${apps[0]}/Contents/Info.plist"
+          plutil -lint "$plist"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")
+          file "${apps[0]}/Contents/MacOS/$executable"
+          lipo -verify_arch "$expectedArch" "${apps[0]}/Contents/MacOS/$executable"
+          mkdir -p downloads
+          dmgName="niqivoAI-2.1.0-macos-$expectedArch.dmg"
+          cp "${files[0]}" "downloads/$dmgName"
+          (cd downloads && shasum -a 256 "$dmgName" > "SHA256SUMS-$expectedArch.txt")
+          printf 'Version: 2.1.0\nArchitecture: %s\nSource SHA-256: %s\nApple Developer ID: absent\nApple notarization: absent\n' \
+            "$expectedArch" "$sourceSha256" > "downloads/buildInfo-$expectedArch.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: niqivoAI-macos-${{ matrix.arch }}
+          path: downloads/
+          if-no-files-found: error
+          retention-days: 7
